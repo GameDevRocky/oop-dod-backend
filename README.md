@@ -29,25 +29,12 @@ No manager, storage class, property number, or pool resizing is required.
 Properties with the same value type remain separate because their nested tag
 types identify their columns.
 
-## Build and test
+## CMake usage
 
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-ctest --test-dir build --output-on-failure
+```cmake
+add_subdirectory(oop-dod-backend)
+target_link_libraries(your_target PRIVATE dod::dod)
 ```
-
-For GCC or Clang sanitizer builds:
-
-```sh
-cmake -S . -B build-asan -DDOD_ENABLE_SANITIZERS=ON \
-  -DDOD_BUILD_BENCHMARKS=OFF
-cmake --build build-asan
-ctest --test-dir build-asan --output-on-failure
-```
-
-Run `dod_benchmark` for a lightweight comparison of AoS, property-proxy, and
-direct SoA span access.
 
 ## Semantics and constraints
 
