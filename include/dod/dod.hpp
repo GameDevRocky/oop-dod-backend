@@ -1,13 +1,11 @@
 #pragma once
 
-#include <atomic>
 #include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <new>
 #include <span>
 #include <stdexcept>
@@ -161,7 +159,6 @@ public:
     Registry& operator=(const Registry&) = delete;
 
     [[nodiscard]] EntityHandle create() {
-        auto lock = lock_structure();
         if (dense_to_sparse_.size() == Capacity) {
             throw std::length_error("DOD registry capacity exceeded");
         }
@@ -194,8 +191,7 @@ public:
     }
 
     void destroy(EntityHandle handle) noexcept {
-        auto lock = lock_structure();
-        if (!is_alive_unlocked(handle)) {
+        if (!is_alive_impl(handle)) {
 #ifndef NDEBUG
             assert(false && "attempted to destroy a stale DOD handle");
 #endif
@@ -224,14 +220,14 @@ public:
 
     template <class Tag, class T>
     Column<T, Capacity>& column() {
-        // One cache per Owner/Capacity/Tag/T, safely published after complete
-        // registration. Columns live until registry shutdown and never move.
-        static std::atomic<Column<T, Capacity>*> cached{nullptr};
-        if (auto* result = cached.load(std::memory_order_acquire)) {
+        // One cache per Owner/Capacity/Tag/T. Columns live until registry
+        // shutdown and never move.
+        static Column<T, Capacity>* cached = nullptr;
+        if (cached != nullptr) {
+            auto* result = cached;
             return *result;
         }
 
-        auto lock = lock_structure();
         const std::type_index key(typeid(Tag));
         if (const auto found = column_indices_.find(key);
             found != column_indices_.end()) {
@@ -241,7 +237,7 @@ public:
                     "the property tag is already registered with another type");
             }
             auto* result = static_cast<Column<T, Capacity>*>(&existing);
-            cached.store(result, std::memory_order_release);
+            cached = result;
             return *result;
         }
 
@@ -255,44 +251,23 @@ public:
             columns_.pop_back();
             throw;
         }
-        cached.store(result, std::memory_order_release);
+        cached = result;
         return *result;
     }
 
     [[nodiscard]] std::size_t dense_index(EntityHandle handle) const {
-        // Property access deliberately takes no lock. The documented contract
-        // forbids structural mutation concurrent with unprotected access.
-        if (!is_alive_unlocked(handle)) {
+        if (!is_alive_impl(handle)) {
             throw std::logic_error("access through a stale or moved-from handle");
         }
         return slots_[handle.slot].dense;
     }
 
     [[nodiscard]] bool is_alive(EntityHandle handle) const noexcept {
-        auto lock = lock_structure();
-        return is_alive_unlocked(handle);
+        return is_alive_impl(handle);
     }
 
     [[nodiscard]] std::size_t size() const noexcept {
-        auto lock = lock_structure();
         return dense_to_sparse_.size();
-    }
-
-    template <class Function>
-    decltype(auto) with_structural_batch(Function&& function) {
-        auto lock = lock_structure();
-        struct RestoreBatchState {
-            Registry& registry;
-            bool previous;
-            ~RestoreBatchState() noexcept {
-                batch_active_ = previous;
-                if (!previous) {
-                    registry.batch_in_progress_.store(false, std::memory_order_relaxed);
-                }
-            }
-        } restore{*this, std::exchange(batch_active_, true)};
-        batch_in_progress_.store(true, std::memory_order_relaxed);
-        return std::forward<Function>(function)();
     }
 
     template <class Tag, class T>
@@ -306,22 +281,6 @@ public:
 private:
     static constexpr std::uint32_t npos = EntityHandle::invalid_slot;
 
-    // Only the thread that owns the outer batch lock skips per-operation
-    // locking. Other threads continue to acquire the same registry mutex.
-    inline static thread_local bool batch_active_ = false;
-
-    [[nodiscard]] std::unique_lock<std::mutex> lock_structure() const {
-        std::unique_lock lock(mutex_, std::defer_lock);
-        // Most calls are outside a batch. Avoid a TLS lookup on that path
-        // (some toolchains implement TLS with a comparatively costly call).
-        // This flag is only a hint: mutex ownership or this thread's batch
-        // state, not the flag, determines whether it may mutate the registry.
-        if (!batch_in_progress_.load(std::memory_order_relaxed) || !batch_active_) {
-            lock.lock();
-        }
-        return lock;
-    }
-
     struct Slot {
         std::uint32_t dense{npos};
         std::uint32_t generation{};
@@ -332,14 +291,12 @@ private:
         free_slots_.reserve(Capacity);
     }
 
-    [[nodiscard]] bool is_alive_unlocked(EntityHandle handle) const noexcept {
+    [[nodiscard]] bool is_alive_impl(EntityHandle handle) const noexcept {
         return handle.valid() && handle.slot < Capacity &&
                slots_[handle.slot].dense != npos &&
                slots_[handle.slot].generation == handle.generation;
     }
 
-    mutable std::mutex mutex_;
-    std::atomic<bool> batch_in_progress_{false};
     // Keep the hash table on the cold schema path; structural loops traverse
     // the contiguous pointer list. Dense index and generation share a slot.
     std::unordered_map<std::type_index, std::size_t> column_indices_;
@@ -522,13 +479,6 @@ public:
     }
 
     [[nodiscard]] static std::size_t size() noexcept { return registry().size(); }
-
-    // Execute synchronous lifecycle operations under one registry lock.
-    // Each entity retains its usual RAII, capacity, and rollback semantics.
-    template <class Function>
-    static decltype(auto) with_structural_batch(Function&& function) {
-        return registry().with_structural_batch(std::forward<Function>(function));
-    }
 
     [[nodiscard]] static bool is_alive(EntityHandle handle) noexcept {
         return registry().is_alive(handle);
