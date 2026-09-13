@@ -491,11 +491,6 @@ public:
 
     [[nodiscard]] EntityHandle dod_handle() const noexcept { return handle_; }
 
-    template <class T, class Tag>
-    [[nodiscard]] static std::span<T> view() {
-        return registry().template view<Tag, T>();
-    }
-
     template <auto Member>
         requires requires {
             typename detail::property_member_traits<decltype(Member)>::value_type;
@@ -534,5 +529,6 @@ private:
 } // namespace dod
 
 #define DOD_PROPERTY(Type, Name)                                             \
-    struct Name##_tag final {};                                              \
-    ::dod::Property<dod_owner_type, Type, Name##_tag> Name{this->dod_handle()}
+    ::dod::Property<dod_owner_type, Type, decltype([] {})> Name{              \
+        this->dod_handle()                                                    \
+    }

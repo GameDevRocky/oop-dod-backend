@@ -26,8 +26,8 @@ for (int& health : Player::view<&Player::health>()) {
 ```
 
 No manager, storage class, property number, or pool resizing is required.
-Properties with the same value type remain separate because their nested tag
-types identify their columns.
+Properties with the same value type remain separate because each property has
+a unique internal tag type.
 
 Pass a property member to `view` to infer both its value type and internal
 column tag:
