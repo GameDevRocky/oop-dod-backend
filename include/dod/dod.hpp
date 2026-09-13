@@ -4,11 +4,13 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
 #include <span>
 #include <stdexcept>
+#include <tuple>
 #include <typeindex>
 #include <typeinfo>
 #include <type_traits>
@@ -16,7 +18,21 @@
 #include <utility>
 #include <vector>
 
+#ifndef DOD_ENABLE_HANDLE_CHECKS
+#ifdef NDEBUG
+#define DOD_ENABLE_HANDLE_CHECKS 0
+#else
+#define DOD_ENABLE_HANDLE_CHECKS 1
+#endif
+#endif
+
+#if DOD_ENABLE_HANDLE_CHECKS != 0 && DOD_ENABLE_HANDLE_CHECKS != 1
+#error "DOD_ENABLE_HANDLE_CHECKS must be 0 or 1"
+#endif
+
 namespace dod {
+
+inline constexpr std::size_t default_capacity = 100'000;
 
 struct EntityHandle {
     std::uint32_t slot{invalid_slot};
@@ -42,7 +58,8 @@ public:
     [[nodiscard]] virtual std::size_t size() const noexcept = 0;
 };
 
-template <class T, std::size_t Capacity>
+template <class T, std::size_t Capacity,
+          class Allocator = std::allocator<std::byte>>
 class Column final : public IColumn {
     static_assert(std::default_initializable<T>,
                   "DOD property types must be default constructible");
@@ -53,12 +70,21 @@ class Column final : public IColumn {
                   "DOD property destructors must be noexcept");
 
 public:
-    explicit Column(std::size_t initial_size = 0) {
+    using allocator_type = typename std::allocator_traits<Allocator>::template
+        rebind_alloc<T>;
+    using allocator_traits = std::allocator_traits<allocator_type>;
+    using allocation_pointer = typename allocator_traits::pointer;
+
+    explicit Column(std::size_t initial_size = 0,
+                    const Allocator& allocator = Allocator{})
+        : allocator_(allocator) {
         if (initial_size > Capacity) {
             throw std::length_error("initial column size exceeds capacity");
         }
         if constexpr (Capacity != 0) {
-            data_ = allocator_.allocate(Capacity);
+            allocation_ = allocator_traits::allocate(allocator_, Capacity);
+            data_ = std::to_address(allocation_);
+            allocated_ = true;
         }
         try {
             while (size_ < initial_size) {
@@ -132,22 +158,28 @@ private:
 
     void deallocate() noexcept {
         if constexpr (Capacity != 0) {
-            if (data_ != nullptr) {
-                allocator_.deallocate(data_, Capacity);
+            if (allocated_) {
+                allocator_traits::deallocate(allocator_, allocation_, Capacity);
+                allocated_ = false;
                 data_ = nullptr;
             }
         }
     }
 
-    std::allocator<T> allocator_;
+    allocator_type allocator_;
+    allocation_pointer allocation_{};
     T* data_{};
     std::size_t size_{};
+    bool allocated_{};
 };
 
-template <class Owner, std::size_t Capacity>
+template <class Owner, std::size_t Capacity,
+          class Allocator = std::allocator<std::byte>>
 class Registry {
     static_assert(Capacity <= EntityHandle::invalid_slot,
                   "capacity does not fit in EntityHandle::slot");
+    static_assert(std::default_initializable<Allocator>,
+                  "the DOD column allocator must be default constructible");
 
 public:
     static Registry& instance() {
@@ -219,10 +251,10 @@ public:
     }
 
     template <class Tag, class T>
-    Column<T, Capacity>& column() {
+    Column<T, Capacity, Allocator>& column() {
         // One cache per Owner/Capacity/Tag/T. Columns live until registry
         // shutdown and never move.
-        static Column<T, Capacity>* cached = nullptr;
+        static Column<T, Capacity, Allocator>* cached = nullptr;
         if (cached != nullptr) {
             auto* result = cached;
             return *result;
@@ -236,13 +268,13 @@ public:
                 throw std::logic_error(
                     "the property tag is already registered with another type");
             }
-            auto* result = static_cast<Column<T, Capacity>*>(&existing);
+            auto* result = static_cast<Column<T, Capacity, Allocator>*>(&existing);
             cached = result;
             return *result;
         }
 
-        auto created = std::make_unique<Column<T, Capacity>>(
-            dense_to_sparse_.size());
+        auto created = std::make_unique<Column<T, Capacity, Allocator>>(
+            dense_to_sparse_.size(), allocator_);
         auto* result = created.get();
         columns_.push_back(std::move(created));
         try {
@@ -256,9 +288,11 @@ public:
     }
 
     [[nodiscard]] std::size_t dense_index(EntityHandle handle) const {
+#if DOD_ENABLE_HANDLE_CHECKS
         if (!is_alive_impl(handle)) {
             throw std::logic_error("access through a stale or moved-from handle");
         }
+#endif
         return slots_[handle.slot].dense;
     }
 
@@ -305,23 +339,23 @@ private:
     std::vector<std::uint32_t> dense_to_sparse_;
     std::vector<std::uint32_t> free_slots_;
     std::uint32_t next_slot_{};
+    [[no_unique_address]] Allocator allocator_{};
 };
 
 template <class Owner, class T, class Tag>
 class Property {
 public:
-    using owner_type = Owner;
-    using value_type = T;
-    using tag_type = Tag;
-
     explicit Property(EntityHandle handle)
-        : handle_(handle), column_(&Owner::template dod_column<Tag, T>()) {}
+        : handle_(handle) {
+        if (column_ == nullptr) {
+            column_ = &registry().template column<Tag, T>();
+        }
+    }
 
     Property(const Property&) = delete;
 
     Property(Property&& other) noexcept
-        : handle_(std::exchange(other.handle_, {})),
-          column_(std::exchange(other.column_, nullptr)) {}
+        : handle_(std::exchange(other.handle_, {})) {}
 
     Property& operator=(const Property& other)
         requires requires(T& target, const T& value) { target = value; }
@@ -332,7 +366,6 @@ public:
     Property& operator=(Property&& other) noexcept {
         if (this != &other) {
             handle_ = std::exchange(other.handle_, {});
-            column_ = std::exchange(other.column_, nullptr);
         }
         return *this;
     }
@@ -363,12 +396,12 @@ public:
 
     [[nodiscard]] T& ref() {
         verify_proxy();
-        return (*column_)[Owner::dod_dense_index(handle_)];
+        return (*column_)[registry().dense_index(handle_)];
     }
 
     [[nodiscard]] const T& const_ref() const {
         verify_proxy();
-        return (*column_)[Owner::dod_dense_index(handle_)];
+        return (*column_)[registry().dense_index(handle_)];
     }
 
     operator T() const
@@ -437,13 +470,21 @@ public:
 
 private:
     void verify_proxy() const {
-        if (!handle_.valid() || column_ == nullptr) {
+#if DOD_ENABLE_HANDLE_CHECKS
+        if (!handle_.valid()) {
             throw std::logic_error("access through a moved-from property");
         }
+#endif
     }
 
+    using allocator_type = typename Owner::dod_allocator_type;
+    using registry_type = Registry<Owner, Owner::dod_capacity, allocator_type>;
+    using column_type = Column<T, Owner::dod_capacity, allocator_type>;
+
+    static registry_type& registry() { return registry_type::instance(); }
+
     EntityHandle handle_;
-    Column<T, Owner::dod_capacity>* column_{};
+    inline static column_type* column_{};
 };
 
 namespace detail {
@@ -458,12 +499,21 @@ struct property_member_traits<Property<Owner, T, Tag> Owner::*> {
     using tag_type = Tag;
 };
 
+template <class MemberPointer>
+concept property_member_pointer = requires {
+    typename property_member_traits<MemberPointer>::owner_type;
+    typename property_member_traits<MemberPointer>::value_type;
+    typename property_member_traits<MemberPointer>::tag_type;
+};
+
 } // namespace detail
 
-template <class Derived, std::size_t Capacity>
+template <class Derived, std::size_t Capacity = default_capacity,
+          class Allocator = std::allocator<std::byte>>
 class Object {
 public:
     using dod_owner_type = Derived;
+    using dod_allocator_type = Allocator;
     static constexpr std::size_t dod_capacity = Capacity;
 
     Object() : handle_(registry().create()) {}
@@ -483,18 +533,10 @@ public:
         return *this;
     }
 
-    ~Object() {
-        if (handle_.valid()) {
-            registry().destroy(handle_);
-        }
-    }
-
     [[nodiscard]] EntityHandle dod_handle() const noexcept { return handle_; }
 
     template <auto Member>
-        requires requires {
-            typename detail::property_member_traits<decltype(Member)>::value_type;
-        }
+        requires detail::property_member_pointer<decltype(Member)>
     [[nodiscard]] static auto view() {
         using traits = detail::property_member_traits<decltype(Member)>;
         static_assert(std::same_as<typename traits::owner_type, Derived>,
@@ -503,24 +545,47 @@ public:
                                         typename traits::value_type>();
     }
 
+    template <auto... Members, class Function>
+        requires(sizeof...(Members) > 0 &&
+                 (detail::property_member_pointer<decltype(Members)> && ...))
+    static void each(Function&& function) {
+        static_assert(
+            (std::same_as<typename detail::property_member_traits<
+                              decltype(Members)>::owner_type,
+                          Derived> && ...),
+            "every property must belong to this object type");
+
+        auto views = std::tuple{view<Members>()...};
+        auto&& callable = function;
+        const auto count = std::get<0>(views).size();
+        for (std::size_t index = 0; index < count; ++index) {
+            invoke_row(callable, views, index,
+                       std::make_index_sequence<sizeof...(Members)>{});
+        }
+    }
+
     [[nodiscard]] static std::size_t size() noexcept { return registry().size(); }
 
     [[nodiscard]] static bool is_alive(EntityHandle handle) noexcept {
         return registry().is_alive(handle);
     }
 
-    template <class Tag, class T>
-    static Column<T, Capacity>& dod_column() {
-        return registry().template column<Tag, T>();
-    }
-
-    [[nodiscard]] static std::size_t dod_dense_index(EntityHandle handle) {
-        return registry().dense_index(handle);
+protected:
+    ~Object() {
+        if (handle_.valid()) {
+            registry().destroy(handle_);
+        }
     }
 
 private:
-    static Registry<Derived, Capacity>& registry() {
-        return Registry<Derived, Capacity>::instance();
+    template <class Function, class Views, std::size_t... Indices>
+    static void invoke_row(Function& function, Views& views, std::size_t row,
+                           std::index_sequence<Indices...>) {
+        std::invoke(function, std::get<Indices>(views)[row]...);
+    }
+
+    static Registry<Derived, Capacity, Allocator>& registry() {
+        return Registry<Derived, Capacity, Allocator>::instance();
     }
 
     EntityHandle handle_{};
