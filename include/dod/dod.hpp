@@ -310,6 +310,10 @@ private:
 template <class Owner, class T, class Tag>
 class Property {
 public:
+    using owner_type = Owner;
+    using value_type = T;
+    using tag_type = Tag;
+
     explicit Property(EntityHandle handle)
         : handle_(handle), column_(&Owner::template dod_column<Tag, T>()) {}
 
@@ -442,6 +446,20 @@ private:
     Column<T, Owner::dod_capacity>* column_{};
 };
 
+namespace detail {
+
+template <class>
+struct property_member_traits;
+
+template <class Owner, class T, class Tag>
+struct property_member_traits<Property<Owner, T, Tag> Owner::*> {
+    using owner_type = Owner;
+    using value_type = T;
+    using tag_type = Tag;
+};
+
+} // namespace detail
+
 template <class Derived, std::size_t Capacity>
 class Object {
 public:
@@ -476,6 +494,18 @@ public:
     template <class T, class Tag>
     [[nodiscard]] static std::span<T> view() {
         return registry().template view<Tag, T>();
+    }
+
+    template <auto Member>
+        requires requires {
+            typename detail::property_member_traits<decltype(Member)>::value_type;
+        }
+    [[nodiscard]] static auto view() {
+        using traits = detail::property_member_traits<decltype(Member)>;
+        static_assert(std::same_as<typename traits::owner_type, Derived>,
+                      "the property must belong to this object type");
+        return registry().template view<typename traits::tag_type,
+                                        typename traits::value_type>();
     }
 
     [[nodiscard]] static std::size_t size() noexcept { return registry().size(); }
